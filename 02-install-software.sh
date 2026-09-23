@@ -190,6 +190,7 @@ run_gum_choose() { # run_gum_choose <gum choose args...> → selection on stdout
 # ---------------------------------------------------------------------------
 MENU_ORDER=(
     docker
+    k3s
     gh
     google-cloud-cli
     terraform
@@ -203,6 +204,7 @@ MENU_ORDER=(
 
 declare -A RECIPES=(
     [docker]="Docker Engine — docker-ce + buildx + compose plugin"
+    [k3s]="k3s — lightweight Kubernetes + optional helm/k9s tooling"
     [gh]="GitHub CLI — gh from the official apt repo"
     [google-cloud-cli]="Google Cloud CLI — gcloud from Google's apt repo"
     [terraform]="Terraform — HashiCorp apt repo"
@@ -218,6 +220,7 @@ declare -A RECIPES=(
 # previously installed (used to pre-check menu entries).
 declare -A MARKERS=(
     [docker]="docker-ce"
+    [k3s]="k3s"
     [gh]="gh"
     [google-cloud-cli]="google-cloud-cli"
     [terraform]="terraform"
@@ -263,6 +266,112 @@ install_docker() {
     fi
     have docker || { err "docker binary not found after install"; return 1; }
     ok "$(docker --version 2>/dev/null || sudo docker --version)"
+}
+
+install_k3s() {
+    banner "k3s — lightweight Kubernetes"
+    have curl || apt_install "curl prerequisite" curl
+    local ver arch tag deb sel item waited=0
+    local -a extras=()
+
+    if have k3s; then
+        ver="$(k3s --version 2>/dev/null | awk '{print $3}')"
+        ok "k3s ${ver:-already present} — moving on to cluster setup."
+    else
+        step "running the official installer (get.k3s.io)"
+        curl -sfL https://get.k3s.io | sudo sh - \
+            || { err "k3s installer failed"; return 1; }
+        have k3s || { err "k3s binary not found after install"; return 1; }
+        ver="$(k3s --version 2>/dev/null | awk '{print $3}')"
+        ok "k3s ${ver} installed (kubectl/crictl/ctr symlinks included)"
+    fi
+
+    if ! sudo k3s kubectl get nodes >/dev/null 2>&1; then
+        step "starting k3s (systemd unit — or background start on non-systemd WSL)"
+        sudo systemctl enable --now k3s 2>/dev/null \
+            || sudo sh -c 'nohup k3s server >>/var/log/k3s-server.log 2>&1 &' \
+            || muted "could not auto-start k3s — run: sudo k3s server"
+    fi
+
+    step "waiting for the k3s API to answer (up to 120 s)"
+    while ! sudo k3s kubectl get --raw /readyz >/dev/null 2>&1; do
+        sleep 5
+        waited=$((waited + 5))
+        (( waited >= 120 )) && break
+    done
+    if sudo k3s kubectl get --raw /readyz >/dev/null 2>&1; then
+        ok "cluster ready:"
+        sudo k3s kubectl get nodes 2>/dev/null | tail -n +2 \
+            | while IFS= read -r line; do info "$line"; done
+    else
+        err "k3s API not ready after ${waited} s"
+        info "first start pulls container images — retry: sudo k3s kubectl get nodes"
+        info "non-systemd WSL keeps the server log at /var/log/k3s-server.log"
+        return 1
+    fi
+
+    step "kubeconfig for '$USER' → $HOME/.kube/config"
+    mkdir -p "$HOME/.kube"
+    if sudo k3s kubectl config view --raw > "$HOME/.kube/config" 2>/dev/null; then
+        chmod 600 "$HOME/.kube/config"
+        ok "kubeconfig written (server https://127.0.0.1:6443 · chmod 600)"
+    else
+        err "could not write $HOME/.kube/config"
+        return 1
+    fi
+
+    if have kubectl; then
+        ok "kubectl already on PATH ($(command -v kubectl))"
+    else
+        sudo ln -sf /usr/local/bin/k3s /usr/local/bin/kubectl
+        ok "kubectl symlinked → /usr/local/bin/kubectl (k3s multi-call binary)"
+    fi
+
+    step "optional Kubernetes tooling"
+    if [[ -t 0 ]]; then
+        local extra_header
+        extra_header="$(gum style --bold 'Optional Kubernetes tooling')
+space or x toggle · enter confirm · esc skip"
+        sel="$(run_gum_choose --no-limit --header "$extra_header" \
+            'helm — the Kubernetes package manager' \
+            'k9s — terminal UI for clusters')" || sel=""
+        [[ -n "$sel" ]] && mapfile -t extras < <(printf '%s\n' "$sel" | awk '{print $1}')
+    else
+        info "non-interactive shell — skipping the helm/k9s menu."
+    fi
+
+    for item in "${extras[@]}"; do
+        case "$item" in
+            helm)
+                step "helm — official installer script (get-helm-4)"
+                if curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-4 | bash; then
+                    have helm \
+                        && ok "helm $(helm version --short 2>/dev/null)" \
+                        || { err "helm binary not found after install"; return 1; }
+                else
+                    err "helm installer failed"; return 1
+                fi
+                ;;
+            k9s)
+                arch="$(dpkg --print-architecture)"    # amd64 / arm64
+                deb="/tmp/k9s_linux_${arch}.deb"
+                step "k9s — querying the latest GitHub release"
+                tag="$(curl -fsSL https://api.github.com/repos/derailed/k9s/releases/latest \
+                    | grep -oE '"tag_name":[[:space:]]*"v[0-9.]+"' | head -1 | grep -oE 'v[0-9.]+')" || true
+                [[ -n "$tag" ]] || { err "could not determine the latest k9s release"; return 1; }
+                step "downloading k9s ${tag} (linux/${arch})"
+                curl -fsSL "https://github.com/derailed/k9s/releases/download/${tag}/k9s_linux_${arch}.deb" \
+                    -o "$deb" || { err "download failed"; return 1; }
+                step "installing $deb"
+                sudo dpkg -i "$deb" || sudo apt-get install -f -y
+                rm -f "$deb"
+                have k9s || { err "k9s binary not found after install"; return 1; }
+                ok "k9s ${tag#v} — launch with: k9s"
+                ;;
+        esac
+    done
+    (( ${#extras[@]} )) || muted "no extra tooling selected."
+    muted "uninstall k3s later with: /usr/local/bin/k3s-uninstall.sh"
 }
 
 install_gh() {

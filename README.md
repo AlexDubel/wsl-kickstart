@@ -22,8 +22,9 @@ repositories** (no random PPAs, no tarball roulette).
   confirm, done.
 - **🕰️ Remembers your old machine** — feed it an exported `apt` history and
   every recipe you had before comes back pre-checked.
-- **🧩 Ten curated recipes** — each installs from the vendor's own repo
-  (Docker, GitHub, Google, HashiCorp, Microsoft, NodeSource…).
+- **🧩 Eleven curated recipes** — each installs from the vendor's own repo
+  (Docker, GitHub, Google, HashiCorp, Microsoft, NodeSource…), plus an
+  optional k3s recipe for a local Kubernetes cluster.
 - **🧯 Fault tolerant** — recipes install one by one; a failure shows up in
   the summary but never aborts the run.
 - **🔁 Idempotent** — both scripts are safe to re-run.
@@ -51,11 +52,12 @@ cd wsl-kickstart
 
 ## Recipes
 
-Ten curated recipes — the list mirrors the apt-install history of the dev
-machine this repo replaced:
+Eleven curated recipes — ten mirror the apt-install history of the dev
+machine this repo replaced; k3s adds an optional local Kubernetes cluster:
 
 ```text
 docker            Docker Engine — docker-ce + buildx + compose plugin
+k3s               k3s — lightweight Kubernetes + optional helm/k9s tooling
 gh                GitHub CLI — gh from the official apt repo
 google-cloud-cli  Google Cloud CLI — gcloud from Google's apt repo
 terraform         Terraform — HashiCorp apt repo
@@ -159,4 +161,11 @@ summary; a failing recipe never aborts the rest of the run.
   `/etc/wsl.conf` (`[boot]` → `systemd=true`); otherwise the script falls
   back to `sudo service docker start`. The optional `docker` group prompt
   needs a re-login (`newgrp docker`) to take effect.
+- **k3s on WSL**: with systemd enabled k3s runs as a service and survives
+  WSL restarts; without it the recipe starts the server in the background
+  (log: `/var/log/k3s-server.log`) — after a WSL restart bring it back
+  with `sudo k3s server &`. The kubeconfig for your user lands in
+  `~/.kube/config` (server `https://127.0.0.1:6443`), `kubectl` is
+  symlinked to the k3s multi-call binary if not already present, and
+  `/usr/local/bin/k3s-uninstall.sh` removes the whole cluster again.
 - Both scripts are idempotent: safe to re-run.
