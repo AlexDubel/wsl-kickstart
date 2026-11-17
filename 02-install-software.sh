@@ -196,6 +196,7 @@ MENU_ORDER=(
     terraform
     powershell
     python3
+    uv
     git
     build-essential
     cli-utils
@@ -210,6 +211,7 @@ declare -A RECIPES=(
     [terraform]="Terraform — HashiCorp apt repo"
     [powershell]="PowerShell — Microsoft apt repo; universal .deb fallback"
     [python3]="Python 3 — pip + venv + is-python3 + dev headers"
+    [uv]="uv/uvx install — fast Python package and tool manager"
     [git]="Git"
     [build-essential]="Build tools — gcc + g++ + make"
     [cli-utils]="CLI utilities — jq unzip zip fzf ripgrep tree htop"
@@ -226,14 +228,26 @@ declare -A MARKERS=(
     [terraform]="terraform"
     [powershell]="powershell"
     [python3]="python-is-python3 python3-pip"
+    [uv]=""
     [git]="git"
     [build-essential]="build-essential"
     [cli-utils]="jq"
     [nodejs]="nodejs"
 )
 
+APT_UPDATED=0
+
+apt_update() { # apt_update [force]
+    if [[ "${1:-}" == "force" ]] || (( ! APT_UPDATED )); then
+        step "refreshing apt package index"
+        sudo DEBIAN_FRONTEND=noninteractive apt-get update || return 1
+        APT_UPDATED=1
+    fi
+}
+
 apt_install() { # apt_install <label> <pkg...>
     local label="$1"; shift
+    apt_update || return 1
     step "$label — apt install: $*"
     sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"
 }
@@ -243,22 +257,24 @@ apt_install() { # apt_install <label> <pkg...>
 # ---------------------------------------------------------------------------
 install_docker() {
     banner "Docker Engine"
-    step "prerequisites: ca-certificates + curl"
-    sudo apt update && sudo apt install -y ca-certificates curl
+    apt_install "prerequisites: ca-certificates + curl" ca-certificates curl || return 1
     step "Docker's official GPG key → /etc/apt/keyrings/docker.asc"
     sudo install -m 0755 -d /etc/apt/keyrings
-    sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+    sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc \
+        || { err "failed to download Docker GPG key"; return 1; }
     sudo chmod a+r /etc/apt/keyrings/docker.asc
     step "repository → /etc/apt/sources.list.d/docker.list"
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
         | sudo tee /etc/apt/sources.list.d/docker.list >/dev/null
-    step "installing docker-ce docker-ce-cli containerd.io buildx compose plugins"
-    sudo apt update && sudo apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+    apt_update force || return 1
+    apt_install "Docker Engine" docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin || return 1
     step "starting the docker service (systemd or SysV — WSL supports both)"
     sudo systemctl enable --now docker 2>/dev/null \
         || sudo service docker start 2>/dev/null \
         || muted "could not auto-start docker — run: sudo service docker start"
-    if gum confirm "Add '$USER' to the 'docker' group (run docker without sudo)?"; then
+    if id -nG "$USER" 2>/dev/null | grep -qw docker; then
+        ok "'$USER' is already in the docker group."
+    elif [[ -t 0 ]] && gum confirm "Add '$USER' to the 'docker' group (run docker without sudo)?"; then
         sudo usermod -aG docker "$USER"
         ok "'$USER' added to the docker group — re-login or 'newgrp docker' to apply."
     else
@@ -270,7 +286,7 @@ install_docker() {
 
 install_k3s() {
     banner "k3s — lightweight Kubernetes"
-    have curl || apt_install "curl prerequisite" curl
+    have curl || apt_install "curl prerequisite" curl || return 1
     local ver arch tag deb sel item waited=0
     local -a extras=()
 
@@ -289,7 +305,7 @@ install_k3s() {
     if ! sudo k3s kubectl get nodes >/dev/null 2>&1; then
         step "starting k3s (systemd unit — or background start on non-systemd WSL)"
         sudo systemctl enable --now k3s 2>/dev/null \
-            || sudo sh -c 'nohup k3s server >>/var/log/k3s-server.log 2>&1 &' \
+            || sudo sh -c 'nohup k3s server </dev/null >>/var/log/k3s-server.log 2>&1 &' \
             || muted "could not auto-start k3s — run: sudo k3s server"
     fi
 
@@ -312,8 +328,9 @@ install_k3s() {
 
     step "kubeconfig for '$USER' → $HOME/.kube/config"
     mkdir -p "$HOME/.kube"
+    install -m 600 /dev/null "$HOME/.kube/config" \
+        || { err "could not secure $HOME/.kube/config"; return 1; }
     if sudo k3s kubectl config view --raw > "$HOME/.kube/config" 2>/dev/null; then
-        chmod 600 "$HOME/.kube/config"
         ok "kubeconfig written (server https://127.0.0.1:6443 · chmod 600)"
     else
         err "could not write $HOME/.kube/config"
@@ -363,7 +380,11 @@ space or x toggle · enter confirm · esc skip"
                 curl -fsSL "https://github.com/derailed/k9s/releases/download/${tag}/k9s_linux_${arch}.deb" \
                     -o "$deb" || { err "download failed"; return 1; }
                 step "installing $deb"
-                sudo dpkg -i "$deb" || sudo apt-get install -f -y
+                if ! sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "$deb"; then
+                    rm -f "$deb"
+                    err "failed to install $deb"
+                    return 1
+                fi
                 rm -f "$deb"
                 have k9s || { err "k9s binary not found after install"; return 1; }
                 ok "k9s ${tag#v} — launch with: k9s"
@@ -376,56 +397,73 @@ space or x toggle · enter confirm · esc skip"
 
 install_gh() {
     banner "GitHub CLI"
+    have curl || apt_install "curl prerequisite" curl || return 1
     step "GPG key → /etc/apt/keyrings/githubcli-archive-keyring.gpg"
-    sudo mkdir -p -m 3755 /etc/apt/keyrings
+    sudo install -m 0755 -d /etc/apt/keyrings
     curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
-        | sudo tee /etc/apt/keyrings/githubcli-archive-keyring.gpg >/dev/null
+        | sudo tee /etc/apt/keyrings/githubcli-archive-keyring.gpg >/dev/null \
+        || { err "failed to download GitHub CLI GPG key"; return 1; }
     sudo chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
     step "repository → /etc/apt/sources.list.d/github-cli.list"
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
         | sudo tee /etc/apt/sources.list.d/github-cli.list >/dev/null
-    step "installing gh"
-    sudo apt update && sudo apt install -y gh
+    apt_update force || return 1
+    apt_install "GitHub CLI" gh || return 1
     have gh || { err "gh binary not found after install"; return 1; }
     ok "$(gh --version | head -1)"
 }
 
 install_google_cloud_cli() {
     banner "Google Cloud CLI"
-    step "prerequisites: ca-certificates + curl + apt-transport-https"
-    sudo apt-get install -y ca-certificates curl apt-transport-https
+    local pkg prereqs_installed=1
+    for pkg in ca-certificates curl gnupg apt-transport-https; do
+        dpkg-query -W -f='${db:Status-Status}' "$pkg" 2>/dev/null \
+            | grep -qx installed || prereqs_installed=0
+    done
+    if (( ! prereqs_installed )); then
+        apt_install "prerequisites: ca-certificates + curl + gnupg + apt-transport-https" \
+            ca-certificates curl gnupg apt-transport-https || return 1
+    fi
     step "Google Cloud GPG key → /usr/share/keyrings/cloud.google.gpg"
-    sudo curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg \
-        -o /usr/share/keyrings/cloud.google.gpg
+    sudo install -m 0755 -d /usr/share/keyrings
+    sudo rm -f /usr/share/keyrings/cloud.google.gpg   # idempotency
+    curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg \
+        | sudo gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg \
+        || { err "failed to import Google Cloud GPG key"; return 1; }
+    sudo chmod a+r /usr/share/keyrings/cloud.google.gpg
     step "repository → /etc/apt/sources.list.d/google-cloud-sdk.list"
     echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" \
         | sudo tee /etc/apt/sources.list.d/google-cloud-sdk.list >/dev/null
-    step "installing google-cloud-cli"
-    sudo apt update && sudo apt install -y google-cloud-cli
+    apt_update force || return 1
+    apt_install "Google Cloud CLI" google-cloud-cli || return 1
     have gcloud || { err "gcloud binary not found after install"; return 1; }
     ok "gcloud installed — start with: gcloud init"
 }
 
 install_terraform() {
     banner "Terraform"
-    have wget        || apt_install "wget prerequisite" wget
-    have lsb_release || apt_install "lsb_release prerequisite" lsb-release
+    have wget        || apt_install "wget prerequisite" wget               || return 1
+    have gpg         || apt_install "gnupg prerequisite" gnupg             || return 1
+    have lsb_release || apt_install "lsb_release prerequisite" lsb-release || return 1
     step "HashiCorp GPG key → /usr/share/keyrings/hashicorp-archive-keyring.gpg"
+    sudo install -m 0755 -d /usr/share/keyrings
     sudo rm -f /usr/share/keyrings/hashicorp-archive-keyring.gpg   # idempotency
     wget -q -O - https://apt.releases.hashicorp.com/gpg \
-        | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+        | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg \
+        || { err "failed to import HashiCorp GPG key"; return 1; }
+    sudo chmod a+r /usr/share/keyrings/hashicorp-archive-keyring.gpg
     step "repository → /etc/apt/sources.list.d/hashicorp.list"
     echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" \
         | sudo tee /etc/apt/sources.list.d/hashicorp.list >/dev/null
-    step "installing terraform"
-    sudo apt update && sudo apt install -y terraform
+    apt_update force || return 1
+    apt_install "Terraform" terraform || return 1
     have terraform || { err "terraform binary not found after install"; return 1; }
     ok "terraform $(terraform version 2>/dev/null | head -1 | awk '{print $2}')"
 }
 
 install_powershell() {
     banner "PowerShell"
-    have wget || apt_install "wget prerequisite" wget
+    have wget || apt_install "wget prerequisite" wget || return 1
     local os_id arch tag ver deb="/tmp/packages-microsoft-prod.deb"
     os_id="$(. /etc/os-release && echo "$VERSION_ID")"
     arch="$(dpkg --print-architecture)"    # amd64 / arm64
@@ -435,10 +473,10 @@ install_powershell() {
     step "downloading Microsoft repo package for Ubuntu $os_id"
     if wget -q "https://packages.microsoft.com/config/ubuntu/$os_id/packages-microsoft-prod.deb" -O "$deb"; then
         step "installing repo package: $deb"
-        sudo dpkg -i "$deb" || sudo apt-get install -f -y
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "$deb" || true
         rm -f "$deb"
         step "installing powershell from the Microsoft apt repo"
-        if sudo apt-get update -qq && sudo apt-get install -y powershell && have pwsh; then
+        if apt_update force && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y powershell && have pwsh; then
             ok "pwsh $(pwsh --version 2>/dev/null) — Microsoft apt repo"
             return 0
         fi
@@ -446,6 +484,7 @@ install_powershell() {
         # Ubuntu 26.04 (resolute) only carries powershell-preview in PMC so far.
         info "Microsoft's $os_id repo has no stable 'powershell' package yet"
     else
+        rm -f "$deb"
         info "no Microsoft repo config for Ubuntu $os_id"
     fi
 
@@ -460,9 +499,14 @@ install_powershell() {
     deb="/tmp/powershell_${ver}-1.deb_${arch}.deb"
     step "downloading universal package: powershell_${ver}-1.deb_${arch}.deb"
     wget -q "https://github.com/PowerShell/PowerShell/releases/download/${tag}/powershell_${ver}-1.deb_${arch}.deb" -O "$deb" \
-        || { err "download failed"; return 1; }
+        || { rm -f "$deb"; err "download failed"; return 1; }
+    apt_update || { rm -f "$deb"; return 1; }
     step "installing $deb"
-    sudo dpkg -i "$deb" || sudo apt-get install -f -y
+    if ! sudo DEBIAN_FRONTEND=noninteractive apt-get install -y "$deb"; then
+        rm -f "$deb"
+        err "failed to install $deb"
+        return 1
+    fi
     rm -f "$deb"
     have pwsh || { err "pwsh binary not found after install"; return 1; }
     ok "pwsh $(pwsh --version 2>/dev/null) — GitHub release ${tag}"
@@ -472,39 +516,56 @@ install_powershell() {
 
 install_python3() {
     banner "Python 3"
-    apt_install "Python 3 toolchain" python3 python3-pip python3-venv python3-dev python-is-python3
+    apt_install "Python 3 toolchain" python3 python3-pip python3-venv python3-dev python-is-python3 || return 1
     have pip3 || { err "pip3 not found after install"; return 1; }
     ok "$(python3 --version) · $(pip3 --version 2>/dev/null | awk '{print $1, $2}')"
     muted "create virtual envs with: python3 -m venv ~/.venvs/<name>"
 }
 
+install_uv() {
+    banner "uv / uvx"
+    have curl || apt_install "curl prerequisite" curl || return 1
+    step "running the official installer (astral.sh/uv/install.sh)"
+    curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR="$HOME/.local/bin" sh \
+        || { err "uv installer failed"; return 1; }
+    if [[ -d "$HOME/.local/bin" && ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
+        export PATH="$HOME/.local/bin:$PATH"
+    fi
+    have uv  || { err "uv binary not found after install"; return 1; }
+    have uvx || { err "uvx binary not found after install"; return 1; }
+    ok "$(uv --version) · uvx $(uvx --version 2>/dev/null | awk '{print $2}')"
+    muted "installed to ~/.local/bin — open a new shell or run: source ~/.local/bin/env"
+}
+
 install_git() {
     banner "Git"
-    apt_install "Git" git
+    apt_install "Git" git || return 1
     have git || { err "git binary not found after install"; return 1; }
     ok "$(git --version)"
 }
 
 install_build_essential() {
     banner "Build tools"
-    apt_install "build-essential" build-essential
+    apt_install "build-essential" build-essential || return 1
     have gcc || { err "gcc not found after install"; return 1; }
     ok "$(gcc --version | head -1)"
 }
 
 install_cli_utils() {
     banner "CLI utilities"
-    apt_install "CLI utilities" jq unzip zip fzf ripgrep tree htop
+    apt_install "CLI utilities" jq unzip zip fzf ripgrep tree htop || return 1
     have jq || { err "jq not found after install"; return 1; }
     ok "jq · unzip · zip · fzf · rg · tree · htop"
 }
 
 install_nodejs() {
     banner "Node.js LTS (NodeSource)"
+    have curl || apt_install "curl prerequisite" curl || return 1
     step "NodeSource setup script (setup_lts.x)"
-    curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash -
-    step "installing nodejs (includes npm + corepack)"
-    sudo apt install -y nodejs
+    curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash - \
+        || { err "NodeSource setup script failed"; return 1; }
+    APT_UPDATED=1
+    apt_install "Node.js (includes npm + corepack)" nodejs || return 1
     have node || { err "node binary not found after install"; return 1; }
     ok "node $(node --version) · npm v$(npm --version 2>/dev/null || echo '?')"
 }
@@ -523,9 +584,10 @@ history_log_packages() { # → package names seen in Install: lines (sorted, uni
     fi | awk '
         /^Install:/ {
             sub(/^Install:[ \t]*/, "")
-            n = split($0, grp, ", ")
+            gsub(/\([^)]*\)/, "")                  # strip "(ver)" / "(ver, automatic)"
+            n = split($0, grp, ",")
             for (i = 1; i <= n; i++) {
-                split(grp[i], pkg, ":")            # "pkg:arch (ver…)" → "pkg"
+                split(grp[i], pkg, ":")            # "pkg:arch" → "pkg"
                 gsub(/^[ \t]+|[ \t]+$/, "", pkg[1])
                 if (pkg[1] != "") print pkg[1]
             }
@@ -646,11 +708,11 @@ main() {
         esac
     done
 
+    [[ $EUID -eq 0 ]] && die "run as your normal user (sudo is used where needed), not as root."
     have gum || die "gum is required — run ./01-install-gum.sh first."
     apply_gum_theme
 
     banner "WSL dev image · software installer"
-    sudo -v || die "sudo access is required to install software."
 
     if (( ${#picks[@]} )); then
         # recipes given on the command line — explicit intent, no confirm needed
@@ -681,11 +743,14 @@ main() {
             || die "aborted — nothing was installed."
     fi
 
+    sudo -v || die "sudo access is required to install software."
+
     i=0
     for key in "${keys[@]}"; do
         i=$((i + 1))
         echo
         hdr "[$i/${#keys[@]}] ${RECIPES[$key]}"
+        sudo -v 2>/dev/null || true
         if "install_${key//-/_}"; then
             done_ok+=("$key")
         else
