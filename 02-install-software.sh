@@ -328,7 +328,8 @@ install_k3s() {
 
     step "kubeconfig for '$USER' → $HOME/.kube/config"
     mkdir -p "$HOME/.kube"
-    install -m 600 /dev/null "$HOME/.kube/config"
+    install -m 600 /dev/null "$HOME/.kube/config" \
+        || { err "could not secure $HOME/.kube/config"; return 1; }
     if sudo k3s kubectl config view --raw > "$HOME/.kube/config" 2>/dev/null; then
         ok "kubeconfig written (server https://127.0.0.1:6443 · chmod 600)"
     else
@@ -414,8 +415,15 @@ install_gh() {
 
 install_google_cloud_cli() {
     banner "Google Cloud CLI"
-    apt_install "prerequisites: ca-certificates + curl + gnupg + apt-transport-https" \
-        ca-certificates curl gnupg apt-transport-https || return 1
+    local pkg prereqs_installed=1
+    for pkg in ca-certificates curl gnupg apt-transport-https; do
+        dpkg-query -W -f='${db:Status-Status}' "$pkg" 2>/dev/null \
+            | grep -qx installed || prereqs_installed=0
+    done
+    if (( ! prereqs_installed )); then
+        apt_install "prerequisites: ca-certificates + curl + gnupg + apt-transport-https" \
+            ca-certificates curl gnupg apt-transport-https || return 1
+    fi
     step "Google Cloud GPG key → /usr/share/keyrings/cloud.google.gpg"
     sudo install -m 0755 -d /usr/share/keyrings
     sudo rm -f /usr/share/keyrings/cloud.google.gpg   # idempotency
@@ -518,7 +526,7 @@ install_uv() {
     banner "uv / uvx"
     have curl || apt_install "curl prerequisite" curl || return 1
     step "running the official installer (astral.sh/uv/install.sh)"
-    curl -LsSf https://astral.sh/uv/install.sh | sh \
+    curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR="$HOME/.local/bin" sh \
         || { err "uv installer failed"; return 1; }
     if [[ -d "$HOME/.local/bin" && ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
         export PATH="$HOME/.local/bin:$PATH"
