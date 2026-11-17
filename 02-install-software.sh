@@ -2,9 +2,8 @@
 # ============================================================================
 # 02-install-software.sh — interactive software picker for a fresh WSL image.
 #
-# Reads the local apt history (or an exported one from your old machine),
-# pre-checks matching entries in a gum multi-select menu, then installs the
-# chosen recipes one by one.
+# Checks local recipe completeness or reads exported apt history, pre-checks
+# matching entries in a gum multi-select menu, then installs chosen recipes.
 #
 # Usage:
 #   ./02-install-software.sh                          interactive menu
@@ -89,7 +88,7 @@ apply_gum_theme() { # gum env styling — unknown vars are simply ignored by gum
 # ---------------------------------------------------------------------------
 gum_space_shim_py=""
 read -r -d '' gum_space_shim_py <<'PYSHIM' || true
-import fcntl, os, pty, select, signal, sys, termios, tty
+import fcntl, os, pty, re, select, signal, sys, termios, tty
 
 cmd = sys.argv[1:]
 if not cmd or not os.isatty(0):
@@ -135,21 +134,65 @@ def on_winch(_signum, _frame):
 
 signal.signal(signal.SIGWINCH, on_winch)
 
+# Match plain space as well as Kitty keyboard protocol (\x1b[32u / \x1b[32;1u)
+# and xterm modifyOtherKeys (\x1b[27;1;32~) space sequences sent by modern
+# terminals like Windows Terminal when bubbletea enables enhanced key reporting.
+space_re = re.compile(rb"( |\x1b\[32(?:;[0-9:]+)?u|\x1b\[27;[0-9]+;32~)")
+move_re = re.compile(rb"(\x1b\[[AB]|\x1bO[AB]|[jk])")
+toggle_re = re.compile(rb"[x\ta]")
+# Strip bubbletea's requests to enable Kitty keyboard protocol / modifyOtherKeys
+# so the outer terminal stays in standard key mode.
+kbd_mode_re = re.compile(rb"\x1b\[(?:>4(?:;[0-9]+)?m|>[0-9]*u|\?u|<[0-9]*u)")
+incomplete_csi_re = re.compile(rb"(\x1b(?:\[[0-?]*[ -/]*|))$")
+
+auto_toggle_on_enter = os.environ.get("GUM_AUTO_TOGGLE_CURSOR") == "1"
+toggled = False
+moved = False
+pending_input = b""
+pending_output = b""
+
 stderr_buf = sys.stderr.buffer
 watch = [0, master]
 try:
     while watch:
-        r, _, _ = select.select(watch, [], [])
+        r, _, _ = select.select(watch, [], [], 0.1 if pending_input == b"\x1b" else None)
+        if not r and pending_input:
+            os.write(master, pending_input)
+            pending_input = b""
+            continue
         if 0 in r:
             try:
                 data = os.read(0, 1024)
             except OSError:
                 data = b""
             if not data:
+                if pending_input:
+                    os.write(master, pending_input)
+                    pending_input = b""
                 watch.remove(0)
             else:
+                data = pending_input + data
+                pending_input = b""
+                match = incomplete_csi_re.search(data)
+                if match:
+                    pending_input = match.group(1)
+                    data = data[:match.start(1)]
                 # the actual fix: make SPACE toggle like "x" does
-                os.write(master, data.replace(b" ", b"x"))
+                if space_re.search(data):
+                    data = space_re.sub(b"x", data)
+                    toggled = True
+                elif toggle_re.search(data):
+                    toggled = True
+                if move_re.search(data):
+                    moved = True
+                # If pre-checked [x] items exist (already-installed packages) and
+                # the user moved the cursor to a package and pressed Enter without
+                # pressing space/x first, toggle the cursor item before submitting.
+                if auto_toggle_on_enter and not toggled and moved and b"\r" in data:
+                    data = data.replace(b"\r", b"x\r", 1)
+                    toggled = True
+                if data:
+                    os.write(master, data)
         if master in r:
             try:
                 data = os.read(master, 65536)
@@ -157,8 +200,17 @@ try:
                 break
             if not data:
                 break
-            stderr_buf.write(data)
+            data = pending_output + data
+            pending_output = b""
+            match = incomplete_csi_re.search(data)
+            if match:
+                pending_output = match.group(1)
+                data = data[:match.start(1)]
+            stderr_buf.write(kbd_mode_re.sub(b"", data))
             stderr_buf.flush()
+    if pending_output:
+        stderr_buf.write(pending_output)
+        stderr_buf.flush()
 finally:
     termios.tcsetattr(0, termios.TCSADRAIN, old_attrs)
     signal.signal(signal.SIGWINCH, signal.SIG_DFL)
@@ -218,8 +270,8 @@ declare -A RECIPES=(
     [nodejs]="Node.js LTS — NodeSource repo (includes npm)"
 )
 
-# Package(s) whose appearance in the apt history mark a recipe as
-# previously installed (used to pre-check menu entries).
+# Package(s) whose appearance in apt history mark a recipe as previously
+# installed, for exported-history preselection.
 declare -A MARKERS=(
     [docker]="docker-ce"
     [k3s]="k3s"
@@ -595,15 +647,77 @@ history_log_packages() { # → package names seen in Install: lines (sorted, uni
 }
 
 history_detected_recipes() { # → recipe keys previously seen in the apt history
-    local hist key marker
+    local hist key marker matched
     hist="$(history_log_packages)"
-    [[ -z "$hist" ]] && return 0
     for key in "${MENU_ORDER[@]}"; do
-        # shellcheck disable=SC2086  # MARKERS may list several packages
-        for marker in ${MARKERS[$key]}; do
-            if grep -qx -- "$marker" <<<"$hist"; then echo "$key"; break; fi
-        done
+        matched=0
+        if [[ -n "$hist" ]]; then
+            # shellcheck disable=SC2086  # MARKERS may list several packages
+            for marker in ${MARKERS[$key]}; do
+                if grep -qx -- "$marker" <<<"$hist"; then matched=1; break; fi
+            done
+        fi
+        (( matched )) && echo "$key"
     done
+}
+
+packages_installed() {
+    local pkg
+    for pkg in "$@"; do
+        dpkg-query -W -f='${db:Status-Status}' "$pkg" 2>/dev/null \
+            | grep -qx installed || return 1
+    done
+}
+
+recipe_is_installed() {
+    case "$1" in
+        docker)
+            packages_installed docker-ce docker-ce-cli containerd.io \
+                docker-buildx-plugin docker-compose-plugin && have docker ;;
+        k3s)
+            have k3s && have kubectl && [[ -s "$HOME/.kube/config" ]] ;;
+        gh)
+            packages_installed gh && have gh ;;
+        google-cloud-cli)
+            packages_installed google-cloud-cli && have gcloud ;;
+        terraform)
+            packages_installed terraform && have terraform ;;
+        powershell)
+            packages_installed powershell && have pwsh ;;
+        python3)
+            packages_installed python3 python3-pip python3-venv python3-dev \
+                python-is-python3 && have python3 && have pip3 ;;
+        uv)
+            { have uv || [[ -x "$HOME/.local/bin/uv" ]]; } \
+                && { have uvx || [[ -x "$HOME/.local/bin/uvx" ]]; } ;;
+        git)
+            packages_installed git && have git ;;
+        build-essential)
+            packages_installed build-essential && have gcc && have g++ && have make ;;
+        cli-utils)
+            packages_installed jq unzip zip fzf ripgrep tree htop \
+                && have jq && have unzip && have zip && have fzf \
+                && have rg && have tree && have htop ;;
+        nodejs)
+            packages_installed nodejs && have node && have npm ;;
+        *)
+            return 1 ;;
+    esac
+}
+
+locally_installed_recipes() {
+    local key
+    for key in "${MENU_ORDER[@]}"; do
+        recipe_is_installed "$key" && printf '%s\n' "$key"
+    done
+}
+
+recipes_to_preselect() {
+    if [[ -z "$HISTORY_FILE" ]]; then
+        locally_installed_recipes
+    else
+        history_detected_recipes
+    fi
 }
 
 show_history() {
@@ -620,10 +734,10 @@ show_history() {
 # ---------------------------------------------------------------------------
 # Menu
 # ---------------------------------------------------------------------------
-choose_from_menu() { # → recipe keys, one per line
-    local -a options=() preselected=() choose_args=()
-    local -A display=()
-    local key joined selection
+choose_from_menu() { # → newly selected recipe keys, one per line
+    local -a options=() preselected=() choose_args=() chosen_keys=()
+    local -A display=() prechecked_map=()
+    local key joined selection header
 
     for key in "${MENU_ORDER[@]}"; do
         display["$key"]="$key — ${RECIPES[$key]}"
@@ -631,8 +745,11 @@ choose_from_menu() { # → recipe keys, one per line
     done
 
     while IFS= read -r key; do
-        [[ -n "$key" ]] && preselected+=("${display[$key]}")
-    done < <(history_detected_recipes)
+        if [[ -n "$key" ]]; then
+            preselected+=("${display[$key]}")
+            prechecked_map["$key"]=1
+        fi
+    done < <(recipes_to_preselect)
 
     joined=""
     if (( ${#preselected[@]} )); then
@@ -640,18 +757,37 @@ choose_from_menu() { # → recipe keys, one per line
         joined="${joined%,}"
     fi
 
-    local header
-    header="$(gum style --bold 'Choose software to install')
+    if [[ -z "$HISTORY_FILE" ]]; then
+        header="$(gum style --bold 'Choose software to install')
 space or x toggle · enter confirm · a select-all · esc cancel
-pre-checked entries were detected in the apt history."
+[x] marks already-installed software — toggle new items to install them."
+    else
+        header="$(gum style --bold 'Choose software to install')
+space or x toggle · enter confirm · a select-all · esc cancel
+pre-checked entries were detected in $HISTORY_FILE."
+    fi
 
-    choose_args=(--no-limit --header "$header")
+    choose_args=(--no-limit --height "$(( ${#options[@]} + 2 ))" --header "$header")
     [[ -n "$joined" ]] && choose_args+=(--selected="$joined")
 
-    selection="$(run_gum_choose "${choose_args[@]}" "${options[@]}")" \
+    local auto_toggle=0
+    [[ -z "$HISTORY_FILE" ]] && auto_toggle=1
+
+    selection="$(GUM_AUTO_TOGGLE_CURSOR="$auto_toggle" run_gum_choose "${choose_args[@]}" "${options[@]}")" \
         || die "selection cancelled."
     [[ -n "$selection" ]] || return 0
-    printf '%s\n' "$selection" | awk '{print $1}'   # display line → recipe key
+
+    mapfile -t chosen_keys < <(printf '%s\n' "$selection" | awk '{print $1}')
+
+    for key in "${chosen_keys[@]}"; do
+        # When running against the local system (no --history file), items that
+        # started pre-checked [x] are already installed — only return newly
+        # checked recipes so we don't reinstall existing software.
+        if [[ -z "$HISTORY_FILE" && -n "${prechecked_map[$key]:-}" ]]; then
+            continue
+        fi
+        printf '%s\n' "$key"
+    done
 }
 
 list_recipes() {
@@ -674,8 +810,9 @@ Usage:
                                                history log (old machine)
   ./02-install-software.sh --help              this help
 
-Recipes are pre-checked in the menu when their marker package appears in the
-apt history (local /var/log/apt/history.log* or the --history file).
+Without --history, recipes are pre-checked when their full installation is
+detected locally. With --history, marker packages in the exported apt history
+are used for preselection.
 
 Theme overrides (environment variables; term256 colour numbers or hex):
   THEME_PRIMARY   headings/banners      (default 212)
@@ -725,7 +862,7 @@ main() {
         mapfile -t keys < <(choose_from_menu)
     fi
 
-    (( ${#keys[@]} )) || { muted "nothing selected — bye."; exit 0; }
+    (( ${#keys[@]} )) || { muted "no new recipes selected — bye."; exit 0; }
 
     hdr "Selected ${#keys[@]} recipe(s)"
     if have gum; then
@@ -735,8 +872,13 @@ main() {
     else
         for key in "${keys[@]}"; do printf '  • %s — %s\n' "$key" "${RECIPES[$key]}"; done
     fi
-    suggestion="$(history_detected_recipes | paste -sd' ' -)"
-    [[ -n "$suggestion" ]] && muted "apt history suggests: $suggestion"
+    if [[ -z "$HISTORY_FILE" ]]; then
+        suggestion="$(locally_installed_recipes | paste -sd' ' -)"
+        [[ -n "$suggestion" ]] && muted "already installed (skipped): $suggestion"
+    else
+        suggestion="$(history_detected_recipes | paste -sd' ' -)"
+        [[ -n "$suggestion" ]] && muted "apt history suggests: $suggestion"
+    fi
 
     if (( ${#picks[@]} == 0 )); then
         gum confirm "Install the ${#keys[@]} selected recipe(s)?" \
