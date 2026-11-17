@@ -86,9 +86,10 @@ nodejs            Node.js LTS — NodeSource repo (includes npm)
 
 ### Preselect from your old machine's apt history
 
-The menu pre-checks any recipe whose marker package appears in the apt
-history. On a fresh image the local history is empty, so export it from the
-old machine first:
+With `--history`, the menu pre-checks any recipe whose marker package appears
+in the exported apt history. Without `--history`, it pre-checks recipes whose
+full installation is currently detected locally. On a fresh image, export the
+old machine's history to restore its previous selections:
 
 ```bash
 # on the OLD machine
