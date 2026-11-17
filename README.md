@@ -22,8 +22,8 @@ repositories** (no random PPAs, no tarball roulette).
   confirm, done.
 - **🕰️ Remembers your old machine** — feed it an exported `apt` history and
   every recipe you had before comes back pre-checked.
-- **🧩 Eleven curated recipes** — each installs from the vendor's own repo
-  (Docker, GitHub, Google, HashiCorp, Microsoft, NodeSource…), plus an
+- **🧩 Twelve curated recipes** — each installs from the vendor's own repo
+  (Docker, GitHub, Google, HashiCorp, Microsoft, NodeSource, Astral…), plus an
   optional k3s recipe for a local Kubernetes cluster.
 - **🧯 Fault tolerant** — recipes install one by one; a failure shows up in
   the summary but never aborts the run.
@@ -52,8 +52,9 @@ cd wsl-kickstart
 
 ## Recipes
 
-Eleven curated recipes — ten mirror the apt-install history of the dev
-machine this repo replaced; k3s adds an optional local Kubernetes cluster:
+Twelve curated recipes — ten mirror the apt-install history of the dev
+machine this repo replaced; `uv` adds Astral's Python package/tool manager
+and `k3s` adds an optional local Kubernetes cluster:
 
 ```text
 docker            Docker Engine — docker-ce + buildx + compose plugin
@@ -63,6 +64,7 @@ google-cloud-cli  Google Cloud CLI — gcloud from Google's apt repo
 terraform         Terraform — HashiCorp apt repo
 powershell        PowerShell — Microsoft apt repo; universal .deb fallback
 python3           Python 3 — pip + venv + is-python3 + dev headers
+uv                uv/uvx install — fast Python package and tool manager
 git               Git
 build-essential   Build tools — gcc + g++ + make
 cli-utils         CLI utilities — jq unzip zip fzf ripgrep tree htop
